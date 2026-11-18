@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <cerrno>
 
 CDMRLookup::CDMRLookup(const std::string& filename, unsigned int reloadTime) :
 CThread(),
@@ -105,43 +106,98 @@ std::string CDMRLookup::find(unsigned int id)
 
 bool CDMRLookup::load()
 {
-	FILE* fp = ::fopen(m_filename.c_str(), "rt");
-	if (fp == NULL) {
-		LogWarning("Cannot open the Id lookup file - %s", m_filename.c_str());
-		return false;
-	}
+        FILE* fp = ::fopen(m_filename.c_str(), "rt");
+        if (fp == NULL) {
+                LogWarning("Cannot open the Id lookup file - %s", m_filename.c_str());
+                return false;
+        }
 
-	m_mutex.lock();
+        std::unordered_map<unsigned int, std::string> newTable;
 
-	// Remove the old entries
-	m_table.clear();
+        char buffer[256U];
+        bool invalid = false;
 
-	char buffer[100U];
-	while (::fgets(buffer, 100U, fp) != NULL) {
-		if (buffer[0U] == '#')
-			continue;
+        while (::fgets(buffer, sizeof(buffer), fp) != NULL) {
+                if (buffer[0U] == '#' || buffer[0U] == '\n')
+                        continue;
 
-		char* p1 = ::strtok(buffer, " \t\r\n");
-		char* p2 = ::strtok(NULL, " \t\r\n");
+                // Accept short final lines without a newline.
+                // Reject records that fill or exceed the buffer.
+                if (::strchr(buffer, '\n') == NULL) {
+                        if (::strlen(buffer) >= sizeof(buffer) - 1U) {
+                                invalid = true;
+                                break;
+                        }
+                }
 
-		if (p1 != NULL && p2 != NULL) {
-			unsigned int id = (unsigned int)::atoi(p1);
-			for (char* p = p2; *p != 0x00U; p++)
-				*p = ::toupper(*p);
+                char* p1 = ::strtok(buffer, " ;\t\r\n");
+                char* p2 = ::strtok(NULL, " ;\t\r\n");
 
-			m_table[id] = std::string(p2);
-		}
-	}
+                if (p1 == NULL || p2 == NULL) {
+                        invalid = true;
+                        break;
+                }
 
-	m_mutex.unlock();
+                for (const char* p = p1; *p != '\0'; p++) {
+                        if (*p < '0' || *p > '9') {
+                                invalid = true;
+                                break;
+                        }
+                }
 
-	::fclose(fp);
+                if (invalid)
+                        break;
 
-	size_t size = m_table.size();
-	if (size == 0U)
-		return false;
+                errno = 0;
+                char* end = NULL;
+                unsigned long id = ::strtoul(p1, &end, 10);
 
-	LogInfo("Loaded %u Ids to the callsign lookup table", size);
+                if (errno == ERANGE || *end != '\0' ||
+                    id == 0UL || id > 0xFFFFFFFFUL) {
+                        invalid = true;
+                        break;
+                }
 
-	return true;
+                for (char* p = p2; *p != '\0'; p++) {
+                        unsigned char c = (unsigned char)*p;
+
+                        if (!::isalnum(c) && c != '/' && c != '-') {
+                                invalid = true;
+                                break;
+                        }
+
+                        *p = (char)::toupper(c);
+                }
+
+                if (invalid)
+                        break;
+
+                if (!newTable.emplace(
+                        (unsigned int)id, std::string(p2)).second) {
+                        invalid = true;
+                        break;
+                }
+        }
+
+        if (::ferror(fp))
+                invalid = true;
+
+        ::fclose(fp);
+
+        if (invalid || newTable.empty()) {
+                LogWarning("Invalid or empty Id lookup file - %s",
+                           m_filename.c_str());
+                return false;
+        }
+
+        size_t size = newTable.size();
+
+        m_mutex.lock();
+        m_table.swap(newTable);
+        m_mutex.unlock();
+
+        LogInfo("Loaded %u Ids to the callsign lookup table",
+                (unsigned int)size);
+
+        return true;
 }

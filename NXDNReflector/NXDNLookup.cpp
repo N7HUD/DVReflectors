@@ -24,6 +24,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <cerrno>
+#include <fstream>
 
 CNXDNLookup::CNXDNLookup(const std::string& filename, unsigned int reloadTime) :
 CThread(),
@@ -116,45 +118,115 @@ bool CNXDNLookup::exists(unsigned int id)
 
 bool CNXDNLookup::load()
 {
-	FILE* fp = ::fopen(m_filename.c_str(), "rt");
-	if (fp == NULL) {
-		LogWarning("Cannot open the NXDN Id lookup file - %s", m_filename.c_str());
-		return false;
-	}
+        std::ifstream file(m_filename.c_str());
+        if (!file.is_open()) {
+                LogWarning("Cannot open the NXDN Id lookup file - %s",
+                           m_filename.c_str());
+                return false;
+        }
 
-	m_mutex.lock();
+        std::unordered_map<unsigned int, std::string> newTable;
+        std::string line;
+        bool invalid = false;
+        bool headerSeen = false;
 
-	// Remove the old entries
-	m_table.clear();
+        while (std::getline(file, line)) {
+                if (!line.empty() && line.back() == '\r')
+                        line.pop_back();
 
-	char buffer[100U];
-	while (::fgets(buffer, 100U, fp) != NULL) {
-		if (buffer[0U] == '#')
-			continue;
+                if (line.empty() || line[0U] == '#')
+                        continue;
 
-		char* p1 = ::strtok(buffer, ",\t\r\n");
-		char* p2 = ::strtok(NULL, ",\t\r\n");
+                if (line.size() > 4096U) {
+                        invalid = true;
+                        break;
+                }
 
-		if (p1 != NULL && p2 != NULL) {
-			unsigned int id = (unsigned int)::atoi(p1);
-			if (id > 0U) {
-				for (char* p = p2; *p != 0x00U; p++)
-					*p = ::toupper(*p);
+                std::size_t comma1 = line.find(',');
+                if (comma1 == std::string::npos) {
+                        invalid = true;
+                        break;
+                }
 
-				m_table[id] = std::string(p2);
-			}
-		}
-	}
+                std::size_t comma2 = line.find(',', comma1 + 1U);
 
-	m_mutex.unlock();
+                std::string idText = line.substr(0U, comma1);
+                std::string callsign = line.substr(
+                    comma1 + 1U,
+                    comma2 == std::string::npos
+                        ? std::string::npos
+                        : comma2 - comma1 - 1U);
 
-	::fclose(fp);
+                if (idText == "RADIO_ID" &&
+                    callsign == "CALLSIGN") {
+                        if (headerSeen || !newTable.empty()) {
+                                invalid = true;
+                                break;
+                        }
+                        headerSeen = true;
+                        continue;
+                }
 
-	size_t size = m_table.size();
-	if (size == 0U)
-		return false;
+                if (idText.empty() || callsign.empty()) {
+                        invalid = true;
+                        break;
+                }
 
-	LogInfo("Loaded %u Ids to the NXDN callsign lookup table", size);
+                for (char c : idText) {
+                        if (c < '0' || c > '9') {
+                                invalid = true;
+                                break;
+                        }
+                }
 
-	return true;
+                if (invalid)
+                        break;
+
+                errno = 0;
+                char* end = NULL;
+                unsigned long id = ::strtoul(idText.c_str(), &end, 10);
+
+                if (errno == ERANGE || *end != '\0' ||
+                    id == 0UL || id > 65535UL) {
+                        invalid = true;
+                        break;
+                }
+
+                for (char& c : callsign) {
+                        unsigned char ch = (unsigned char)c;
+                        if (!::isalnum(ch) && ch != '/' && ch != '-') {
+                                invalid = true;
+                                break;
+                        }
+                        c = (char)::toupper(ch);
+                }
+
+                if (invalid)
+                        break;
+
+                if (!newTable.emplace((unsigned int)id, callsign).second) {
+                        invalid = true;
+                        break;
+                }
+        }
+
+        if (file.bad())
+                invalid = true;
+
+        if (invalid || newTable.empty()) {
+                LogWarning("Invalid or empty NXDN Id lookup file - %s",
+                           m_filename.c_str());
+                return false;
+        }
+
+        size_t size = newTable.size();
+
+        m_mutex.lock();
+        m_table.swap(newTable);
+        m_mutex.unlock();
+
+        LogInfo("Loaded %u Ids to the NXDN callsign lookup table",
+                (unsigned int)size);
+
+        return true;
 }
